@@ -1,4 +1,4 @@
-# Spectralformer: Rethinking hyperspectral image classification with transformers
+# Research on Hyperspectral Remote Sensing Alteration Mineral Mapping Method of Uranium Resources Using an Improved ViT Model
 
 
     
