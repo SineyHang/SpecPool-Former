@@ -8,28 +8,30 @@ from scipy.io import savemat
 from torch import optim
 from torch.autograd import Variable
 from vit_pytorch import ViT
+from SpecPool_model import SpecPool
 from sklearn.metrics import confusion_matrix
-
 import matplotlib.pyplot as plt
 from matplotlib import colors
 import numpy as np
 import time
+from Hu_model import HuEtAl
 import os
 
 parser = argparse.ArgumentParser("HSI")
-parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Houston'], default='Indian', help='dataset to use')
+parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Houston'], default='Pavia', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
 parser.add_argument('--mode', choices=['ViT', 'CAF'], default='ViT', help='mode choice')
+parser.add_argument('--model', choices=['ViT&SpectralFormer', 'SpecPool', '1D-CNN'], default='ViT&SpectralFormer', help='model choice')
 parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
-parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
+parser.add_argument('--test_freq', type=int, default=1, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=1, help='number of patches')
 parser.add_argument('--band_patches', type=int, default=1, help='number of related band')
-parser.add_argument('--epoches', type=int, default=300, help='epoch number')
+parser.add_argument('--epoches', type=int, default=100, help='epoch number')
 parser.add_argument('--learning_rate', type=float, default=5e-4, help='learning rate')
 parser.add_argument('--gamma', type=float, default=0.9, help='gamma')
-parser.add_argument('--weight_decay', type=float, default=0, help='weight_decay')
+parser.add_argument('--weight_decay', type=float, default=5e-3, help='weight_decay')
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
@@ -303,18 +305,41 @@ cudnn.benchmark = False
 # prepare data
 if args.dataset == 'Indian':
     data = loadmat('./data/IndianPine.mat')
+    color_mat = loadmat('./data/AVIRIS_colormap.mat')
+    TR = data['TR']
+    TE = data['TE']
+    input = data['input']  # (145,145,200)
+    label = TR + TE
+    num_classes = np.max(TR)
 elif args.dataset == 'Pavia':
-    data = loadmat('./data/Pavia.mat')
+    data = loadmat('./data/PaviaU/PaviaU.mat')
+    label = loadmat('./data/PaviaU/PaviaU_gt.mat')['paviaU_gt']
+    color_mat = loadmat('./data/AVIRIS_colormap.mat')
+    # 获取所有有效样本的坐标（排除背景0）
+    rows, cols = np.where(label != 0)
+    labels = label[rows, cols]
+    # 随机打乱索引
+    indices = np.random.permutation(len(rows))
+    rows = rows[indices]
+    cols = cols[indices]
+    labels = labels[indices]
+    # 按照9:1比例划分
+    split_idx = int(0.9 * len(rows))
+    train_rows, train_cols = rows[:split_idx], cols[:split_idx]
+    test_rows, test_cols = rows[split_idx:], cols[split_idx:]
+    # 创建训练集和测试集的标签矩阵
+    TR = np.zeros_like(label)  # 训练集标签矩阵
+    TE = np.zeros_like(label)  # 测试集标签矩阵
+    TR[train_rows, train_cols] = label[train_rows, train_cols]
+    TE[test_rows, test_cols] = label[test_rows, test_cols]
+    input = data['paviaU']  # (145,145,200)
+    label = TR + TE
+    num_classes = np.max(TR)
 elif args.dataset == 'Houston':
     data = loadmat('./data/Houston.mat')
 else:
     raise ValueError("Unkknow dataset")
-color_mat = loadmat('./data/AVIRIS_colormap.mat')
-TR = data['TR']
-TE = data['TE']
-input = data['input'] #(145,145,200)
-label = TR + TE
-num_classes = np.max(TR)
+
 
 color_mat_list = list(color_mat)
 color_matrix = color_mat[color_mat_list[3]] #(17,3)
@@ -332,6 +357,7 @@ print("height={0},width={1},band={2}".format(height, width, band))
 total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true = chooose_train_and_test_point(TR, TE, label, num_classes)
 mirror_image = mirror_hsi(height, width, band, input_normalize, patch=args.patches)
 x_train_band, x_test_band, x_true_band = train_and_test_data(mirror_image, band, total_pos_train, total_pos_test, total_pos_true, patch=args.patches, band_patch=args.band_patches)
+
 y_train, y_test, y_true = train_and_test_label(number_train, number_test, number_true, num_classes)
 #-------------------------------------------------------------------------------
 # load data
@@ -351,19 +377,36 @@ label_true_loader=Data.DataLoader(Label_true,batch_size=100,shuffle=False)
 
 #-------------------------------------------------------------------------------
 # create model
-model = ViT(
-    image_size = args.patches,
-    near_band = args.band_patches,
-    num_patches = band,
-    num_classes = num_classes,
-    dim = 64,
-    depth = 5,
-    heads = 4,
-    mlp_dim = 8,
-    dropout = 0.1,
-    emb_dropout = 0.1,
-    mode = args.mode
-)
+if args.model == 'ViT&SpectralFormer':
+    model = ViT(
+        image_size = args.patches,
+        near_band = args.band_patches,
+        num_patches = band,
+        num_classes = num_classes,
+        dim = 64,
+        depth = 5,
+        heads = 4,
+        mlp_dim = 8,
+        dropout = 0.1,
+        emb_dropout = 0.1,
+        mode = args.mode
+    )
+elif args.model == 'SpecPool':
+    model = SpecPool(
+        image_size = args.patches,
+        near_band = 3,
+        num_patches = band,
+        num_classes = num_classes,
+        dim = 64,
+        depth = 5,
+        heads = 4,
+        mlp_dim = 8,
+        dropout = 0.1,
+        emb_dropout = 0.1,
+        mode = args.mode
+    )
+elif args.model == '1D-CNN':
+    model = HuEtAl(band, num_classes)
 model = model.cuda()
 # criterion
 criterion = nn.CrossEntropyLoss().cuda()
@@ -413,7 +456,15 @@ elif args.flag_test == 'train':
             model.eval()
             tar_v, pre_v = valid_epoch(model, label_test_loader, criterion, optimizer)
             OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_v, pre_v)
-
+    # 在所有epoch结束后保存模型
+    if args.mode == 'ViT':
+        torch.save(model.state_dict(), './India_ViT.pt')
+    elif (args.mode == 'CAF') & (args.patches == 1):
+        torch.save(model.state_dict(), './India_SpecPOOL.pt')
+    elif (args.mode == 'CAF') & (args.patches == 7):
+        torch.save(model.state_dict(), './geoSASI_SpectralFormer_patch.pt')
+    else:
+        raise ValueError("Wrong Parameters")
     toc = time.time()
     print("Running Time: {:.2f}".format(toc-tic))
     print("**************************************************")
